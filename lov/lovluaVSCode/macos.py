@@ -1,0 +1,235 @@
+import io
+import os
+import plistlib
+import struct
+import sys
+from pathlib import Path
+from datetime import datetime
+from zipfile import ZipFile
+from urllib.request import urlopen, urlretrieve, URLError
+
+from PIL import Image
+
+from .util import eprint, get_default_love_binary_dir, get_download_url
+from .hooks import execute_target_hook
+
+
+def download_love(version, platform):
+    target_path = get_default_love_binary_dir(version, platform)
+    print("Downloading love binaries to: '{}'".format(target_path))
+
+    os.makedirs(target_path, exist_ok=True)
+    try:
+        download_url = get_download_url(version, platform)
+        print("Downloading '{}'..".format(download_url))
+        urlretrieve(download_url, os.path.join(target_path, "love.zip"))
+    except URLError as exc:
+        eprint("Could not download löve: {}".format(exc))
+        eprint(
+            "If there is in fact no download on GitHub for this version, specify 'love_binaries' manually."
+        )
+        sys.exit(1)
+    print("Download complete")
+
+
+def write_file(pkg, name, content):
+    if isinstance(pkg, str):
+        mode = "w" if isinstance(content, str) else "wb"
+        with open(name, mode) as f:
+            f.write(content)
+    elif isinstance(pkg, ZipFile):
+        pkg.writestr(name, content)
+
+
+def make_icns(iconfile, icon_image_file):
+
+    icon_image = Image.open(icon_image_file)
+
+    
+    width, height = icon_image.size  
+    if width != height:
+        eprint("Invalid image size, discarded: %d x %d." % (width, height))
+        sys.exit(1)
+
+    sizetotypes = {
+        16: [b"icp4"],  
+        32: [b"icp5", b"ic11"],  
+        64: [b"icp6", b"ic12"],  
+        128: [b"ic07"],  
+        256: [b"ic08", b"ic13"],  
+        512: [b"ic09", b"ic14"],  
+        1024: [b"ic10"],  
+    }
+
+    imagedatas = []
+    for size_px, icontypes in sizetotypes.items():
+        img = icon_image.resize((size_px, size_px), Image.LANCZOS)
+        with io.BytesIO() as img_data_f:
+            img.save(img_data_f, "png")
+            for icontype in icontypes:
+                imagedatas.append([icontype, img_data_f.getvalue()])
+
+
+
+    filelen = 8 + sum(len(imagedata) + 8 for (_, imagedata) in sorted(imagedatas))
+    iconfile.write(b"icns")
+    iconfile.write(struct.pack(">I", filelen))
+
+
+
+    for icontype, imagedata in imagedatas:
+        iconfile.write(icontype)  
+        iconfile.write(struct.pack(">I", 8 + len(imagedata))) 
+        iconfile.write(imagedata) 
+
+
+def get_game_icon_content(config):
+
+    icon_file = config.get("macos", {}).get("icon_file")
+    if icon_file is None:
+        icon_file = config.get("icon_file", None)
+    elif not os.path.isfile(icon_file):
+        sys.exit(f"Couldn't find macOS icon_file at {icon_file}")
+
+    if icon_file is None:
+        icon_file = config.get("icon_file", None)
+    elif not os.path.isfile(icon_file):
+        sys.exit(f"Couldn't find icon_file at {icon_file}")
+
+    if not icon_file:
+        return False
+
+    with io.BytesIO() as icns_f, open(icon_file, "rb") as icon_img_f:
+        icon_key = f"{config['name']}.app/Contents/Resources/icon-{config['name']}.icns"
+        if icon_file.lower().endswith(".png"):
+            make_icns(icns_f, icon_img_f)
+            return icns_f.getvalue()
+        else:
+            return icon_img_f.read()
+
+
+def get_info_plist_content(config, version):
+    plist = {
+        "BuildMachineOSBuild": "19B88",
+        "CFBundleDevelopmentRegion": "English",
+        "CFBundleExecutable": "love",
+        "CFBundleIconFile": "icon.icns",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundlePackageType": "APPL",
+        "CFBundleSignature": "LoVe",
+        "CFBundleSupportedPlatforms": ["MacOSX"],
+        "DTCompiler": "com.apple.compilers.llvm.clang.1_0",
+        "DTPlatformBuild": "11C504",
+        "DTPlatformVersion": "GM",
+        "DTSDKBuild": "19B90",
+        "DTSDKName": "macosx10.15",
+        "DTXcode": "1130",
+        "DTXcodeBuild": "11C504",
+        "LSApplicationCategoryType": "public.app-category.games",
+        "LSMinimumSystemVersion": "10.7",
+        "NSHighResolutionCapable": True,
+        "NSPrincipalClass": "NSApplication",
+        "NSSupportsAutomaticGraphicsSwitching": False,
+        "CFBundleShortVersionString": version or config["love_version"],
+        "CFBundleName": config["name"],
+        "NSHumanReadableCopyright": "© 2006-2020 LÖVE Development Team",
+        "CFBundleIdentifier": f"tld.yourgamename",
+    }
+
+    if "macos" in config and "app_metadata" in config["macos"]:
+        metadata = config["macos"]["app_metadata"]
+        plist.update(metadata)
+
+    return plistlib.dumps(plist)
+
+
+def build_macos(config, version, target, target_directory, love_file_path):
+    if target in config and "love_binaries" in config[target]:
+        love_binaries = config[target]["love_binaries"]
+    else:
+        assert "love_version" in config
+        print("No love binaries specified for target {}".format(target))
+        love_binaries = get_default_love_binary_dir(config["love_version"], target)
+        if os.path.isdir(love_binaries):
+            print("Love binaries already present in '{}'".format(love_binaries))
+        else:
+            download_love(config["love_version"], target)
+
+    src = os.path.join(love_binaries, "love.zip")
+    dst = os.path.join(target_directory, f"{config['name']}-{target}.zip")
+    with open(src, "rb") as lovef, ZipFile(lovef) as love_binary_zip, open(
+        dst, "wb+"
+    ) as outf, ZipFile(outf, mode="w") as app_zip, open(
+        love_file_path, "rb"
+    ) as love_zip:
+
+        archive_files = {}
+        if "archive_files" in config:
+            archive_files.update(config["archive_files"])
+        if "macos" in config and "archive_files" in config["macos"]:
+            archive_files.update(config["macos"]["archive_files"])
+        
+        written_archive_files = set()
+        for src_path, dest_path in archive_files.items():
+            path = f"{config['name']}.app/Contents/Resources/{dest_path}"
+            if os.path.isfile(src_path):
+                with open(src_path, "rb") as file:
+                    app_zip.writestr(path, file.read())
+            elif os.path.isdir(src_path):
+                directory = Path(src_path)
+                for file_path in directory.glob("**/*"):
+                    if not file_path.is_file():
+                        continue
+                    with open(file_path, "rb") as file:
+                        relative = file_path.relative_to(src_path)
+                        path = f"{config['name']}.app/Contents/Resources/{dest_path}/{relative}"
+                        app_zip.writestr(path, file.read())
+                        written_archive_files.add(path)
+            else:
+                sys.exit(f"Cannot copy archive file '{src_path}'")
+            written_archive_files.add(path)
+
+        for zipinfo in love_binary_zip.infolist():
+            if not zipinfo.filename.startswith("love.app/"):
+                eprint("Got bad or unxpexpectedly formatted love zip file")
+                sys.exit(1)
+
+            orig_filename = zipinfo.filename
+
+            zipinfo.filename = config["name"] + zipinfo.filename[len("love") :]
+
+
+            zipinfo.date_time = tuple(datetime.now().timetuple()[:6])
+
+            if zipinfo.filename in written_archive_files:
+                continue
+            elif orig_filename == "love.app/Contents/Resources/GameIcon.icns":
+                continue  
+            elif orig_filename == "love.app/Contents/Resources/Assets.car":
+                continue  
+            elif orig_filename == "love.app/Contents/Resources/OS X AppIcon.icns":
+
+                zipinfo = f"{config['name']}.app/Contents/Resources/icon.icns"
+
+                content = get_game_icon_content(config)
+                if not content:
+                    content = love_binary_zip.read(orig_filename)
+            elif orig_filename == "love.app/Contents/Info.plist":
+                app_zip.writestr(
+                    zipinfo.filename, get_info_plist_content(config, version)
+                )
+                continue
+            else:
+                content = love_binary_zip.read(orig_filename)
+
+            app_zip.writestr(zipinfo, content)
+
+        loveZipKey = f"{config['name']}.app/Contents/Resources/{config['name']}.love"
+        app_zip.writestr(loveZipKey, love_zip.read())
+
+    if target in config and "artifacts" in config[target] and "directory" in config[target]["artifacts"]:
+        unzip_dst = os.path.join(target_directory, f"{config['name']}-{target}")
+        with ZipFile(dst, "r") as zip_ref:
+            zip_ref.extractall(unzip_dst)
+        os.remove(dst)
+    
